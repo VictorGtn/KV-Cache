@@ -8,6 +8,7 @@ import time
 from torch.profiler import profile, record_function, ProfilerActivity
 import random
 import numpy as np
+import matplotlib.pyplot as plt
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, config):
@@ -23,12 +24,20 @@ class MultiHeadAttention(nn.Module):
         
         self.max_cache_len = config.max_cache_len
         self.cache_size = 0
-        self.k_cache = torch.zeros(1, self.num_heads, self.max_cache_len, self.head_size)
-        self.v_cache = torch.zeros(1, self.num_heads, self.max_cache_len, self.head_size)
+        self.k_cache = None
+        self.v_cache = None
         
     def forward(self, x, mask=None, use_cache=False):
         batch_size = x.shape[0]
         seq_len = x.shape[1]
+        device = x.device
+        
+        # Initialize cache if not already done
+        if use_cache and self.k_cache is None:
+            self.k_cache = torch.zeros(batch_size, self.num_heads, self.max_cache_len, 
+                                     self.head_size, device=device)
+            self.v_cache = torch.zeros(batch_size, self.num_heads, self.max_cache_len, 
+                                     self.head_size, device=device)
         
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -37,33 +46,28 @@ class MultiHeadAttention(nn.Module):
         q = q.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
         k = k.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
         v = v.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-        
-        print(f"\nInput shape: {x.shape}")
-        print(f"Q shape before cache: {q.shape}")
-        print(f"K shape before cache: {k.shape}")
-        
+
         if use_cache:
             if self.cache_size + seq_len > self.max_cache_len:
+                # If cache is full, shift and append new values
                 shift_amount = seq_len
                 self.k_cache = torch.roll(self.k_cache, shifts=-shift_amount, dims=2)
                 self.v_cache = torch.roll(self.v_cache, shifts=-shift_amount, dims=2)
-                
                 self.k_cache[:, :, -seq_len:] = k
                 self.v_cache[:, :, -seq_len:] = v
                 self.cache_size = self.max_cache_len
             else:
+                # Append new values to cache
                 self.k_cache[:, :, self.cache_size:self.cache_size + seq_len] = k
                 self.v_cache[:, :, self.cache_size:self.cache_size + seq_len] = v
                 self.cache_size += seq_len
             
+            # Use concatenated past and present keys/values for attention
             k = self.k_cache[:, :, :self.cache_size]
             v = self.v_cache[:, :, :self.cache_size]
-            print(f"Cache size: {self.cache_size}")
-            print(f"K shape after cache: {k.shape}")
         
         scale = math.sqrt(self.head_size)
         scores = torch.matmul(q, k.transpose(-2, -1)) / scale
-        print(f"Attention scores shape: {scores.shape}")
         
         attn_weights = F.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, v)
@@ -76,8 +80,9 @@ class MultiHeadAttention(nn.Module):
 
     def reset_cache(self):
         self.cache_size = 0
-        self.k_cache.zero_()
-        self.v_cache.zero_()
+        if self.k_cache is not None:
+            self.k_cache.zero_()
+            self.v_cache.zero_()
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, config):
@@ -126,6 +131,7 @@ class TransformerDecoder(nn.Module):
         token_emb = self.token_embedding(input_ids)
         pos_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         pos_emb = self.position_embedding(pos_ids)
+        pos_emb = torch.zeros_like(token_emb)
         
         x = token_emb + pos_emb
         
@@ -208,8 +214,6 @@ def simulate_generation(model, input_ids, max_new_tokens, use_cache):
     start_time = time.time()
     with torch.no_grad():
         logits = model(input_ids, use_cache=use_cache)
-        print(f"Initial logits shape: {logits.shape}")
-        print(f"Initial next token: {logits[:, -1, :].argmax(dim=-1)}")
     initial_time = time.time() - start_time
     
     generated_ids = input_ids.clone()
@@ -226,9 +230,7 @@ def simulate_generation(model, input_ids, max_new_tokens, use_cache):
             else:
                 # Without cache: process the entire sequence each time
                 logits = model(generated_ids, use_cache=False)
-            
-            print(f"\nStep {i+1}")
-        
+                    
         # Simply take the most probable token
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
         
@@ -259,50 +261,65 @@ def run_simulation():
     
     # Create input sequence
     input_ids = torch.tensor([[1]], device=device)  # Sample input sequence
-    max_new_tokens = 4  # Generate 50 new tokens
     
-    print(f"Running simulation on {device}")
-    print(f"Random seed: {SEED}")
-    print(f"Input sequence length: {input_ids.shape[1]}")
-    print(f"Generating {max_new_tokens} new tokens\n")
-    
-    # Run with cache
-    print("Running with KV cache...")
-    set_seed(SEED)  # Reset seed before each run
-    cached_results = simulate_generation(model, input_ids, max_new_tokens, use_cache=True)
-    
-    # Run without cache
-    print("Running without KV cache...")
-    set_seed(SEED)  # Reset seed before each run
-    uncached_results = simulate_generation(model, input_ids, max_new_tokens, use_cache=False)
-    
-    # Print results
-    print("\nResults:")
-    print(f"Initial forward pass:")
-    print(f"  With cache: {cached_results['initial_time']:.4f}s")
-    print(f"  Without cache: {uncached_results['initial_time']:.4f}s")
+    # Modify the token counts list to go up to 2048
+    token_counts = [32, 64, 128, 256, 512, 1024]  # Extended token counts
+    cached_times = []
+    uncached_times = []
+    cached_avg = []
+    uncached_avg = []
 
-    print("total generation times:")
-    print(f"  With cache: {sum(cached_results['generation_times'])}")
-    print(f"  Without cache: {sum(uncached_results['generation_times'])}")
-    
-    print(f"\nAverage token generation time:")
-    print(f"  With cache: {sum(cached_results['generation_times'])/len(cached_results['generation_times']):.4f}s")
-    print(f"  Without cache: {sum(uncached_results['generation_times'])/len(uncached_results['generation_times']):.4f}s")
-    
-    print(f"\nPeak memory usage:")
-    print(f"  With cache: {max(cached_results['memory_usage']) / 1024**2:.2f} MB")
-    print(f"  Without cache: {max(uncached_results['memory_usage']) / 1024**2:.2f} MB")
+    for token_count in token_counts:
+        print(f"\nTesting with {token_count} new tokens:")
+        
+        # Run with cache
+        set_seed(SEED)
+        cached_results = simulate_generation(model, input_ids, token_count, True)
+        cached_total = cached_results['initial_time'] + sum(cached_results['generation_times'])
+        cached_times.append(cached_total)
+        cached_avg.append(sum(cached_results['generation_times'])/token_count)
+        
+        # Run without cache
+        set_seed(SEED)
+        uncached_results = simulate_generation(model, input_ids, token_count, False)
+        uncached_total = uncached_results['initial_time'] + sum(uncached_results['generation_times'])
+        uncached_times.append(uncached_total)
+        uncached_avg.append(sum(uncached_results['generation_times'])/token_count)
 
+    # Plotting code
+    plt.figure(figsize=(12, 5))
     
+    # Total time plot
+    plt.subplot(1, 2, 1)
+    plt.plot(token_counts, cached_times, 'o-', label='With Cache')
+    plt.plot(token_counts, uncached_times, 'o-', label='Without Cache')
+    plt.xlabel('Number of Tokens Generated')
+    plt.ylabel('Total Time (s)')
+    plt.title('Total Generation Time Comparison')
+    plt.legend()
+    plt.grid(True)
+    
+    # Per-token time plot
+    plt.subplot(1, 2, 2)
+    plt.plot(token_counts, cached_avg, 'o-', label='With Cache')
+    plt.plot(token_counts, uncached_avg, 'o-', label='Without Cache')
+    plt.xlabel('Number of Tokens Generated')
+    plt.ylabel('Average Time per Token (s)')
+    plt.title('Per-Token Generation Time Comparison')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
     # Verify outputs match
     outputs_match = torch.equal(cached_results['generated_ids'], uncached_results['generated_ids'])
     print(f"\nOutputs match: {outputs_match}")
     
     if not outputs_match:
         print("\nWarning: Outputs don't match! Showing first few tokens:")
-        print("Cached output:", cached_results['generated_ids'][0][:10].tolist())
-        print("Uncached output:", uncached_results['generated_ids'][0][:10].tolist())
+    print("Cached output:", cached_results['generated_ids'][0][:50].tolist())
+    print("Uncached output:", uncached_results['generated_ids'][0][:50].tolist())
 
 if __name__ == "__main__":
     run_simulation()
